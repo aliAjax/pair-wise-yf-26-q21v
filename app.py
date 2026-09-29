@@ -8,7 +8,7 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
@@ -142,10 +142,56 @@ class PreservationStore:
                     actor_id TEXT NOT NULL REFERENCES users(id),
                     action TEXT NOT NULL,
                     detail TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    retain_until TEXT
                 );
+                CREATE TABLE IF NOT EXISTS legal_holds(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    version_id INTEGER REFERENCES archive_versions(id),
+                    applicant_id TEXT NOT NULL REFERENCES users(id),
+                    reason TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+                    created_at TEXT NOT NULL,
+                    released_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_legal_holds_archive ON legal_holds(archive_id,status);
+                CREATE INDEX IF NOT EXISTS idx_legal_holds_version ON legal_holds(version_id,status);
+                CREATE TABLE IF NOT EXISTS disposal_tasks(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','failed','blocked')),
+                    started_by TEXT NOT NULL REFERENCES users(id),
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    deleted_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    held_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_disposal_tasks_archive ON disposal_tasks(archive_id,id);
+                CREATE TABLE IF NOT EXISTS disposal_records(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL REFERENCES disposal_tasks(id),
+                    copy_id INTEGER NOT NULL,
+                    location TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','deleted','failed','held')),
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_disposal_records_task ON disposal_records(task_id);
+                CREATE INDEX IF NOT EXISTS idx_disposal_records_copy ON disposal_records(copy_id,status);
                 """
             )
+            # 兼容旧库：只做增量加列，不要求停机回填；旧数据沿用默认状态即可查、可校验
+            for table, column, ddl in [
+                ("archives", "status", "ALTER TABLE archives ADD COLUMN status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','pending_disposal','disposing','disposed'))"),
+                ("copies", "disposal_failed", "ALTER TABLE copies ADD COLUMN disposal_failed INTEGER NOT NULL DEFAULT 0 CHECK(disposal_failed IN (0,1))"),
+                ("audit_log", "retain_until", "ALTER TABLE audit_log ADD COLUMN retain_until TEXT"),
+            ]:
+                cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                if column not in cols:
+                    conn.execute(ddl)
 
     def seed(self) -> None:
         self.init_schema()
@@ -183,9 +229,11 @@ class PreservationStore:
             raise BusinessError("没有该受限档案的访问权限", 403, "forbidden")
 
     def _audit(self, conn, archive_id: int, actor: str, action: str, detail: dict) -> None:
+        # 审计记录保留十年：写入时即确定 retain_until，到期前不删除
+        retain_until = (datetime.now(timezone.utc) + timedelta(days=3650)).isoformat(timespec="seconds")
         conn.execute(
-            "INSERT INTO audit_log(archive_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
-            (archive_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
+            "INSERT INTO audit_log(archive_id,actor_id,action,detail,created_at,retain_until) VALUES(?,?,?,?,?,?)",
+            (archive_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now(), retain_until),
         )
 
     def create_archive(self, user_id: str, name: str, retention_until: str, restricted: bool = True) -> dict:
@@ -308,7 +356,21 @@ class PreservationStore:
                 "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (version_id,)
             ).fetchall()
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (version["archive_id"],)).fetchone()
-            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            holds = conn.execute(
+                """SELECT * FROM legal_holds WHERE archive_id=? AND status='active'
+                   AND (version_id IS NULL OR version_id=?) ORDER BY id""",
+                (version["archive_id"], version_id),
+            ).fetchall()
+            migrated_from = conn.execute(
+                "SELECT * FROM migrations WHERE target_version_id=? ORDER BY id DESC LIMIT 1", (version_id,)
+            ).fetchone()
+            migrated_to = conn.execute(
+                "SELECT * FROM migrations WHERE source_version_id=? ORDER BY id", (version_id,)
+            ).fetchall()
+            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files],
+                    "copies": [dict(x) for x in copies], "holds": [dict(h) for h in holds],
+                    "migrated_from": dict(migrated_from) if migrated_from else None,
+                    "migrated_to": [dict(migrated_to)] if migrated_to else []}
 
     def verify_copy(self, user_id: str, copy_id: int) -> dict:
         with self.connect() as conn:
@@ -420,10 +482,26 @@ class PreservationStore:
                     "INSERT INTO migrations(source_version_id,target_version_id,source_path,target_path,target_format,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
                     (version_id, target_version_id, source_path, converted["path"], target_format.strip(), actor_id, now()),
                 )
+                # 新版本继承源版本的保全关系：覆盖源版本的生效保全（整份级或版本级）
+                # 均派生为目标版本上的版本级保全，保留来源链路，可按原路径追溯
+                source_holds = conn.execute(
+                    """SELECT * FROM legal_holds WHERE archive_id=? AND status='active'
+                       AND (version_id IS NULL OR version_id=?)""",
+                    (source_version["archive_id"], version_id),
+                ).fetchall()
+                for h in source_holds:
+                    scope = "整份档案级" if h["version_id"] is None else f"版本 #{h['version_id']} 级"
+                    conn.execute(
+                        """INSERT INTO legal_holds(archive_id,version_id,applicant_id,reason,status,created_at)
+                           VALUES(?,?,?,?, 'active',?)""",
+                        (source_version["archive_id"], target_version_id, actor_id,
+                         f"迁移继承自保全 #{h['id']}（{scope}）", now()),
+                    )
                 self._audit(
                     conn, source_version["archive_id"], actor_id, "format.migrate",
                     {"source_version_id": version_id, "target_version_id": target_version_id,
-                     "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip()},
+                     "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip(),
+                     "inherited_holds": [h["id"] for h in source_holds]},
                 )
                 return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"]}
             except Exception:
@@ -437,14 +515,296 @@ class PreservationStore:
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
             versions = conn.execute("SELECT id,version,state,created_at FROM archive_versions WHERE archive_id=? ORDER BY version", (archive_id,)).fetchall()
             deadline = date.fromisoformat(archive["retention_until"])
+            active_holds = conn.execute(
+                "SELECT * FROM legal_holds WHERE archive_id=? AND status='active' ORDER BY id", (archive_id,)
+            ).fetchall()
+            latest_task = conn.execute(
+                "SELECT * FROM disposal_tasks WHERE archive_id=? ORDER BY id DESC LIMIT 1", (archive_id,)
+            ).fetchone()
             return {
                 "archive": dict(archive),
                 "days_remaining": (deadline - date.today()).days,
                 "versions": [dict(v) | {"file_count": conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0],
                                          "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0]}
                              for v in versions],
+                "active_holds": [dict(h) for h in active_holds],
+                "disposal": {"latest_task": dict(latest_task) if latest_task else None},
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
+
+    # ---------- 到期处置与法定保全 ----------
+
+    def _active_holds_for_copy(self, conn, archive_id: int, version_id: int) -> list[sqlite3.Row]:
+        return conn.execute(
+            """SELECT * FROM legal_holds
+               WHERE archive_id=? AND status='active'
+                 AND (version_id IS NULL OR version_id=?)
+               ORDER BY id""",
+            (archive_id, version_id),
+        ).fetchall()
+
+    def enter_disposal(self, actor_id: str, archive_id: int) -> dict:
+        """档案进入待处置区。到期（retention_until 已过）或机构主动转入均可。"""
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            self._access(conn, archive_id, actor, require_write=True)
+            if archive["status"] == "disposed":
+                raise BusinessError("档案已处置完成，不能再进入待处置区", 409, "already_disposed")
+            if archive["status"] == "disposing":
+                raise BusinessError("处置任务进行中，请先查询处置状态", 409, "disposal_running")
+            if archive["status"] == "pending_disposal":
+                return {"id": archive_id, "status": "pending_disposal", "changed": False}
+            conn.execute("UPDATE archives SET status='pending_disposal' WHERE id=?", (archive_id,))
+            self._audit(conn, archive_id, actor_id, "disposal.enter", {})
+            return {"id": archive_id, "status": "pending_disposal", "changed": True}
+
+    def start_disposal(self, actor_id: str, archive_id: int) -> dict:
+        """启动处置任务。
+
+        与保全申请并发时由 SQLite BEGIN IMMEDIATE 串行化：先写入状态的一方生效。
+        - 档案不在待处置区 -> 报错；
+        - 已有进行中的任务 -> 按现状返回当前任务；
+        - 存在生效保全 -> 不启动清退，按现状返回保全信息；
+        - 否则建立任务并逐副本清退，每个副本删除前重新校验保全状态，后到的保全不被覆盖。
+        """
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            self._access(conn, archive_id, actor, require_write=True)
+            if archive["status"] == "active":
+                raise BusinessError("档案尚未进入待处置区", 409, "not_in_disposal_area")
+            if archive["status"] == "disposed":
+                raise BusinessError("档案已处置完成", 409, "already_disposed")
+            if archive["status"] == "disposing":
+                task = conn.execute(
+                    "SELECT * FROM disposal_tasks WHERE archive_id=? ORDER BY id DESC LIMIT 1", (archive_id,)
+                ).fetchone()
+                return {"started": False, "state": "disposing", "archive_status": "disposing",
+                        "task": dict(task) if task else None}
+            # 待处置区：先查保全，保全先生效则清退不启动
+            holds = conn.execute(
+                "SELECT * FROM legal_holds WHERE archive_id=? AND status='active' ORDER BY id", (archive_id,)
+            ).fetchall()
+            if holds:
+                return {"started": False, "state": "held", "archive_status": "pending_disposal",
+                        "holds": [dict(h) for h in holds]}
+            copies = conn.execute(
+                """SELECT c.* FROM copies c JOIN archive_versions v ON c.version_id=v.id
+                   WHERE v.archive_id=? ORDER BY c.id""",
+                (archive_id,),
+            ).fetchall()
+            cur = conn.execute(
+                "INSERT INTO disposal_tasks(archive_id,status,started_by,started_at,total_count) VALUES(?,?,?,?,?)",
+                (archive_id, "running", actor_id, now(), len(copies)),
+            )
+            task_id = cur.lastrowid
+            conn.execute("UPDATE archives SET status='disposing' WHERE id=?", (archive_id,))
+            self._audit(conn, archive_id, actor_id, "disposal.start",
+                        {"task_id": task_id, "total_count": len(copies)})
+        result = self._run_disposal(task_id, archive_id)
+        return {"started": True, "state": result["status"], "archive_status": result["archive_status"],
+                "task_id": task_id, "task": result["task"], "records": result["records"]}
+
+    def _run_disposal(self, task_id: int, archive_id: int) -> dict:
+        """逐副本清退。每个副本独立事务，删除前重新校验保全，确保后到的保全不被覆盖。"""
+        with self.connect() as conn:
+            task = conn.execute("SELECT * FROM disposal_tasks WHERE id=?", (task_id,)).fetchone()
+            copies = conn.execute(
+                """SELECT c.* FROM copies c JOIN archive_versions v ON c.version_id=v.id
+                   WHERE v.archive_id=? ORDER BY c.id""",
+                (archive_id,),
+            ).fetchall()
+        deleted = failed = held = 0
+        records: list[dict] = []
+        for copy in copies:
+            with self.connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    block = conn.execute(
+                        """SELECT id FROM legal_holds WHERE archive_id=? AND status='active'
+                           AND (version_id IS NULL OR version_id=?) LIMIT 1""",
+                        (archive_id, copy["version_id"]),
+                    ).fetchone()
+                    if block:
+                        conn.execute(
+                            "INSERT INTO disposal_records(task_id,copy_id,location,status,updated_at) VALUES(?,?,?,?,?)",
+                            (task_id, copy["id"], copy["location"], "held", now()),
+                        )
+                        conn.commit()
+                        held += 1
+                        records.append({"copy_id": copy["id"], "location": copy["location"], "status": "held"})
+                        continue
+                    if copy["disposal_failed"]:
+                        conn.execute(
+                            "INSERT INTO disposal_records(task_id,copy_id,location,status,error,updated_at) VALUES(?,?,?,?,?,?)",
+                            (task_id, copy["id"], copy["location"], "failed", "simulated_storage_error", now()),
+                        )
+                        conn.commit()
+                        failed += 1
+                        records.append({"copy_id": copy["id"], "location": copy["location"], "status": "failed",
+                                         "error": "simulated_storage_error"})
+                        continue
+                    conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy["id"],))
+                    conn.execute("DELETE FROM copies WHERE id=?", (copy["id"],))
+                    conn.execute(
+                        "INSERT INTO disposal_records(task_id,copy_id,location,status,updated_at) VALUES(?,?,?,?,?)",
+                        (task_id, copy["id"], copy["location"], "deleted", now()),
+                    )
+                    conn.commit()
+                    deleted += 1
+                    records.append({"copy_id": copy["id"], "location": copy["location"], "status": "deleted"})
+                except Exception:
+                    conn.rollback()
+                    raise
+        with self.connect() as conn:
+            if failed:
+                status = "failed"
+            elif held:
+                status = "blocked"
+            else:
+                status = "completed"
+            archive_status = "disposed" if status == "completed" else "pending_disposal"
+            conn.execute(
+                """UPDATE disposal_tasks SET status=?,finished_at=?,deleted_count=?,failed_count=?,held_count=?
+                   WHERE id=?""",
+                (status, now(), deleted, failed, held, task_id),
+            )
+            conn.execute("UPDATE archives SET status=? WHERE id=?", (archive_status, archive_id))
+            starter = conn.execute("SELECT started_by FROM disposal_tasks WHERE id=?", (task_id,)).fetchone()
+            self._audit(conn, archive_id, starter["started_by"], "disposal.finish",
+                        {"task_id": task_id, "status": status, "deleted": deleted, "failed": failed, "held": held})
+            task = conn.execute("SELECT * FROM disposal_tasks WHERE id=?", (task_id,)).fetchone()
+        return {"status": status, "archive_status": archive_status, "task": dict(task), "records": records}
+
+    def retry_disposal(self, actor_id: str, archive_id: int) -> dict:
+        """重试清退：只处理尚未删除的副本（已有 deleted 记录的副本不再处理）。"""
+        return self.start_disposal(actor_id, archive_id)
+
+    def disposal_status(self, user_id: str, archive_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            self._access(conn, archive_id, user)
+            tasks = conn.execute(
+                "SELECT * FROM disposal_tasks WHERE archive_id=? ORDER BY id", (archive_id,)
+            ).fetchall()
+            records: list[sqlite3.Row] = []
+            task_ids = [t["id"] for t in tasks]
+            if task_ids:
+                placeholders = ",".join("?" * len(task_ids))
+                records = conn.execute(
+                    f"SELECT * FROM disposal_records WHERE task_id IN ({placeholders}) ORDER BY id", task_ids
+                ).fetchall()
+            holds = conn.execute(
+                "SELECT * FROM legal_holds WHERE archive_id=? AND status='active' ORDER BY id", (archive_id,)
+            ).fetchall()
+            remaining = conn.execute(
+                """SELECT c.id,c.location,c.state,c.disposal_failed,v.version
+                   FROM copies c JOIN archive_versions v ON c.version_id=v.id
+                   WHERE v.archive_id=? ORDER BY c.id""",
+                (archive_id,),
+            ).fetchall()
+            return {
+                "archive": dict(archive),
+                "tasks": [dict(t) for t in tasks],
+                "records": [dict(r) for r in records],
+                "active_holds": [dict(h) for h in holds],
+                "remaining_copies": [dict(r) for r in remaining],
+            }
+
+    def apply_hold(self, actor_id: str, archive_id: int, version_id: int | None = None, reason: str = "") -> dict:
+        """申请法定保全。version_id 为 None 时为整份档案保全，否则为版本保全。
+
+        与处置任务并发时由 BEGIN IMMEDIATE 串行化：若处置已先写入状态，保全仍登记（法律事实），
+        由清退循环在删除前校验，后到的保全不被覆盖；响应按现状返回。
+        """
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            self._access(conn, archive_id, actor, require_write=True)
+            if version_id is not None:
+                version = conn.execute(
+                    "SELECT id FROM archive_versions WHERE id=? AND archive_id=?", (version_id, archive_id)
+                ).fetchone()
+                if not version:
+                    raise BusinessError("版本不存在或不属于该档案", 404, "not_found")
+            reason = reason.strip()
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """INSERT INTO legal_holds(archive_id,version_id,applicant_id,reason,status,created_at)
+                   VALUES(?,?,?,?,'active',?)""",
+                (archive_id, version_id, actor_id, reason, now()),
+            )
+            hold_id = cur.lastrowid
+            self._audit(conn, archive_id, actor_id, "hold.apply",
+                        {"hold_id": hold_id, "version_id": version_id, "reason": reason})
+            hold = conn.execute("SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone()
+            running = conn.execute(
+                "SELECT * FROM disposal_tasks WHERE archive_id=? AND status='running' ORDER BY id DESC LIMIT 1",
+                (archive_id,),
+            ).fetchone()
+            return {"hold": dict(hold), "archive_status": archive["status"],
+                    "disposal_task": dict(running) if running else None}
+
+    def release_hold(self, actor_id: str, hold_id: int) -> dict:
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            hold = conn.execute("SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone()
+            if not hold:
+                raise BusinessError("保全不存在", 404, "not_found")
+            self._access(conn, hold["archive_id"], actor, require_write=True)
+            if hold["status"] != "active":
+                return {"hold": dict(hold), "changed": False}
+            conn.execute("UPDATE legal_holds SET status='released',released_at=? WHERE id=?", (now(), hold_id))
+            self._audit(conn, hold["archive_id"], actor_id, "hold.release", {"hold_id": hold_id})
+            return {"hold": dict(conn.execute("SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone()),
+                    "changed": True}
+
+    def list_holds(self, user_id: str, archive_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            self._access(conn, archive_id, user)
+            holds = conn.execute(
+                "SELECT * FROM legal_holds WHERE archive_id=? ORDER BY id", (archive_id,)
+            ).fetchall()
+            return {"holds": [dict(h) for h in holds]}
+
+    def simulate_disposal_failure(self, user_id: str, copy_id: int, fail: bool = True) -> dict:
+        """仅用于演示/测试：标记副本清退时模拟存储失败。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist"})
+            copy = conn.execute("SELECT * FROM copies WHERE id=?", (copy_id,)).fetchone()
+            if not copy:
+                raise BusinessError("副本不存在", 404, "not_found")
+            version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+            self._access(conn, version["archive_id"], user, require_write=True)
+            conn.execute("UPDATE copies SET disposal_failed=? WHERE id=?", (int(bool(fail)), copy_id))
+            self._audit(conn, version["archive_id"], user_id, "copy.simulate_disposal_failure",
+                        {"copy_id": copy_id, "disposal_failed": bool(fail)})
+            return {"copy_id": copy_id, "disposal_failed": bool(fail)}
+
+    def due_disposals(self, user_id: str) -> dict:
+        """已过保留期但尚未处置完成的档案（到期清单）。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            rows = conn.execute(
+                """SELECT a.* FROM archives a
+                   WHERE a.status != 'disposed' AND a.retention_until < date('now')
+                   ORDER BY a.retention_until"""
+            ).fetchall()
+            return {"archives": [dict(r) for r in rows]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -499,6 +859,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, store.grant(user, archive_id, d.get("user_id", ""), d.get("permission", "")))
         if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "status" and method == "GET":
             return self._send(200, store.archive_status(user, int(parts[2])))
+        if len(parts) == 5 and parts[:2] == ["api", "archives"] and parts[3] == "disposal" and method == "POST":
+            archive_id = int(parts[2])
+            if parts[4] == "enter":
+                return self._send(200, store.enter_disposal(user, archive_id))
+            if parts[4] == "start":
+                return self._send(200, store.start_disposal(user, archive_id))
+            if parts[4] == "retry":
+                return self._send(200, store.retry_disposal(user, archive_id))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "disposal" and method == "GET":
+            return self._send(200, store.disposal_status(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "holds" and method == "POST":
+            d = self._body()
+            version_id = d.get("version_id")
+            return self._send(201, store.apply_hold(user, int(parts[2]), version_id, d.get("reason", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "holds" and method == "GET":
+            return self._send(200, store.list_holds(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "holds"] and parts[3] == "release" and method == "POST":
+            return self._send(200, store.release_hold(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-disposal-failure" and method == "POST":
+            d = self._body()
+            return self._send(200, store.simulate_disposal_failure(user, int(parts[2]), bool(d.get("fail", True))))
+        if parts == ["api", "disposal", "due"] and method == "GET":
+            return self._send(200, store.due_disposals(user))
         if len(parts) == 3 and parts[:2] == ["api", "versions"] and method == "GET":
             return self._send(200, store.get_version(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "copies" and method == "POST":
